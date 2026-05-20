@@ -97,7 +97,6 @@ public class ChatQueueLimiter {
 
     @PostConstruct
     public void subscribeQueueNotify() {
-        initSemaphore();
         pollNotifier = new PollNotifier(this::availablePermits);
         pollNotifier.startCleanup();
         RTopic topic = redissonClient.getTopic(NOTIFY_TOPIC);
@@ -106,26 +105,6 @@ public class ChatQueueLimiter {
                 pollNotifier.fire();
             }
         });
-    }
-
-    /**
-     * 应用启动时强制将信号量许可数与当前配置对齐。
-     * trySetPermits 仅在 key 不存在时生效，配置变更后需删除旧 key 再重新初始化。
-     */
-    private void initSemaphore() {
-        if (!Boolean.TRUE.equals(rateLimitProperties.getGlobalEnabled())) {
-            return;
-        }
-        int configured = rateLimitProperties.getGlobalMaxConcurrent();
-        RPermitExpirableSemaphore semaphore = redissonClient.getPermitExpirableSemaphore(SEMAPHORE_NAME);
-        if (!semaphore.trySetPermits(configured)) {
-            int current = semaphore.availablePermits();
-            if (current != configured) {
-                log.info("信号量许可数与配置不一致（当前={}，配置={}），重新初始化", current, configured);
-                semaphore.delete();
-                semaphore.trySetPermits(configured);
-            }
-        }
     }
 
     public void enqueue(String question, String conversationId, SseEmitter emitter, Runnable onAcquire) {
@@ -193,16 +172,8 @@ public class ChatQueueLimiter {
                 }
                 cancelFuture(futureRef[0]);
                 if (!cancelled.get()) {
-                    // 1. 立即预生成所有 ID，组装上下文，不涉及任何 DB 操作
-                    RejectedContext rejectedContext = buildRejectedContext(question, conversationId, userId);
-                    // 2. 立即向客户端发送 SSE 拒绝事件，不等待落库
+                    RejectedContext rejectedContext = recordRejectedConversation(question, conversationId, userId);
                     sendRejectEvents(emitter, rejectedContext);
-                    // 3. 异步落库，不阻塞 scheduler 线程和客户端响应
-                    if (rejectedContext != null) {
-                        final RejectedContext ctx = rejectedContext;
-                        final String finalUserId = userId;
-                        chatEntryExecutor.execute(() -> persistRejection(ctx, finalUserId, question));
-                    }
                 }
                 return;
             }
@@ -337,14 +308,11 @@ public class ChatQueueLimiter {
         redissonClient.getTopic(NOTIFY_TOPIC).publish("permit_released");
     }
 
-    /**
-     * 纯内存操作：预生成所有 ID 和标题，立即返回，不访问 DB。
-     * 用于在向客户端发送 SSE 拒绝事件前快速构建响应上下文。
-     */
-    private RejectedContext buildRejectedContext(String question, String conversationId, String userId) {
+    private RejectedContext recordRejectedConversation(String question, String conversationId, String userId) {
         if (StrUtil.isBlank(question)) {
             return null;
         }
+
         if (StrUtil.isBlank(userId)) {
             try {
                 userId = StpUtil.getLoginIdAsString();
@@ -352,28 +320,29 @@ public class ChatQueueLimiter {
                 return null;
             }
         }
+
         String actualConversationId = StrUtil.isBlank(conversationId)
                 ? IdUtil.getSnowflakeNextIdStr()
                 : conversationId;
+        boolean isNewConversation = conversationGroupService.findConversation(actualConversationId, userId) == null;
+
+        memoryService.append(actualConversationId, userId, ChatMessage.user(question));
+        String messageId = memoryService.append(actualConversationId, userId, ChatMessage.assistant(REJECT_MESSAGE));
+
+        String title = isNewConversation ? resolveTitle(actualConversationId, userId) : "";
+        if (isNewConversation && StrUtil.isBlank(title)) {
+            title = buildFallbackTitle(question);
+        }
         String taskId = IdUtil.getSnowflakeNextIdStr();
-        String messageId = IdUtil.getSnowflakeNextIdStr();
-        // 标题直接从问题截取，无需 DB 查询
-        String title = buildFallbackTitle(question);
         return new RejectedContext(actualConversationId, taskId, messageId, title);
     }
 
-    /**
-     * 异步落库：将被拒绝的对话记录持久化到 DB，使用与 SSE 响应相同的预生成 ID。
-     */
-    private void persistRejection(RejectedContext ctx, String userId, String question) {
-        try {
-            memoryService.append(ctx.conversationId(), userId,
-                    ChatMessage.user(question));
-            memoryService.appendWithId(ctx.conversationId(), userId,
-                    ChatMessage.assistant(REJECT_MESSAGE), ctx.messageId());
-        } catch (Exception ex) {
-            log.warn("限流拒绝记录落库失败，conversationId={}", ctx.conversationId(), ex);
+    private String resolveTitle(String conversationId, String userId) {
+        var conversation = conversationGroupService.findConversation(conversationId, userId);
+        if (conversation == null) {
+            return "";
         }
+        return conversation.getTitle();
     }
 
     private String buildFallbackTitle(String question) {
