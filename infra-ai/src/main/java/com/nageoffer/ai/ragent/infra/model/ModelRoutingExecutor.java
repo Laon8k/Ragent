@@ -24,6 +24,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
 
@@ -37,6 +38,7 @@ import java.util.function.Function;
 public class ModelRoutingExecutor {
 
     private final ModelHealthStore healthStore;
+    private final ModelConcurrencyStore concurrencyStore;
 
     public <C, T> T executeWithFallback(
             ModelCapability capability,
@@ -49,6 +51,9 @@ public class ModelRoutingExecutor {
         }
 
         Throwable last = null;
+        List<ModelTarget> capacityDeferred = new ArrayList<>();
+
+        // 第一轮：只调用有容量的模型
         for (ModelTarget target : targets) {
             C client = clientResolver.apply(target);
             if (client == null) {
@@ -58,7 +63,11 @@ public class ModelRoutingExecutor {
             if (!healthStore.allowCall(target.id())) {
                 continue;
             }
-
+            int maxConcurrent = resolveMaxConcurrent(target);
+            if (!concurrencyStore.tryAcquire(target.id(), maxConcurrent)) {
+                capacityDeferred.add(target);
+                continue;
+            }
             try {
                 T response = caller.call(client, target);
                 healthStore.markSuccess(target.id());
@@ -67,6 +76,32 @@ public class ModelRoutingExecutor {
                 last = e;
                 healthStore.markFailure(target.id());
                 log.warn("{} model failed, fallback to next. modelId={}, provider={}", label, target.id(), target.candidate().getProvider(), e);
+            } finally {
+                concurrencyStore.release(target.id(), maxConcurrent);
+            }
+        }
+
+        // 第二轮：所有候选容量均满时强制尝试（让 LLM 侧的 429 走正常故障转移）
+        for (ModelTarget target : capacityDeferred) {
+            C client = clientResolver.apply(target);
+            if (client == null) {
+                continue;
+            }
+            if (!healthStore.allowCall(target.id())) {
+                continue;
+            }
+            int maxConcurrent = resolveMaxConcurrent(target);
+            concurrencyStore.forceAcquire(target.id(), maxConcurrent);
+            try {
+                T response = caller.call(client, target);
+                healthStore.markSuccess(target.id());
+                return response;
+            } catch (Exception e) {
+                last = e;
+                healthStore.markFailure(target.id());
+                log.warn("{} model failed (capacity-fallback), fallback to next. modelId={}, provider={}", label, target.id(), target.candidate().getProvider(), e);
+            } finally {
+                concurrencyStore.release(target.id(), maxConcurrent);
             }
         }
 
@@ -75,5 +110,10 @@ public class ModelRoutingExecutor {
                 last,
                 BaseErrorCode.REMOTE_ERROR
         );
+    }
+
+    private static int resolveMaxConcurrent(ModelTarget target) {
+        Integer max = target.candidate().getMaxConcurrent();
+        return max != null ? max : 0;
     }
 }

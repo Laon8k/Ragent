@@ -1,0 +1,151 @@
+{
+  "IntentTreeCacheManagerTest": {
+    "title": "挑战四：一致性与可观测性 — IntentTreeCacheManager Redis 缓存意图树",
+    "description": "验证意图树 Redis 缓存管理器的核心行为：多实例共享 Redis 缓存降低读放大，7 天 TTL 保证最终失效，增删改主动清除，Redis 故障时防御性降级不中断链路。",
+    "cases": {
+      "tc01_cacheMiss_returnsNull": {
+        "id": "TC01",
+        "display": "缓存未命中 → getIntentTreeFromCache 返回 null",
+        "what": "Redis opsForValue().get() 返回 null 时，getIntentTreeFromCache 应返回 null，由调用方决定是否从 DB 重新加载。",
+        "how": "mock valueOps.get() 返回 null → 调用 getIntentTreeFromCache → 断言返回 null。",
+        "metrics": [
+          { "label": "返回值", "expected": "null", "note": "触发 DB 回退加载意图树" }
+        ]
+      },
+      "tc02_cacheHit_deserializesCorrectly": {
+        "id": "TC02",
+        "display": "缓存命中 → JSON 正确反序列化为 IntentNode 列表",
+        "what": "Redis 返回 JSON 字符串时，ObjectMapper.readValue 正确反序列化为 List<IntentNode>，节点 id/name 与原始一致。",
+        "how": "mock valueOps.get() 返回 JSON → mock objectMapper.readValue 返回节点列表 → 断言 id/name 一致。",
+        "metrics": [
+          { "label": "节点数量", "expected": "1", "note": "与 mock 数据一致" },
+          { "label": "节点 id", "expected": "domain-hr", "note": "反序列化正确" }
+        ]
+      },
+      "tc03_save_writesCorrectKeyAndTtl": {
+        "id": "TC03",
+        "display": "saveIntentTreeToCache → set(key, json, 7, DAYS)",
+        "what": "saveIntentTreeToCache 序列化节点列表后，调用 set() 写入 Redis，key 固定为 ragent:intent:tree，TTL=7 天与配置一致。",
+        "how": "mock objectMapper.writeValueAsString 返回 JSON → 调用 save → verify set 参数（key, json, 7L, DAYS）。",
+        "metrics": [
+          { "label": "Redis key", "expected": "ragent:intent:tree", "note": "多实例共享同一 key" },
+          { "label": "TTL", "expected": "7 天", "note": "避免热数据永不过期" }
+        ]
+      },
+      "tc04_clear_keyExists_deletesSuccessfully": {
+        "id": "TC04",
+        "display": "clearIntentTreeCache（key 存在）→ 正常清除",
+        "what": "当 Redis key 存在时（delete 返回 true），clearIntentTreeCache 正常完成，不抛异常。意图节点更新后应调用此方法。",
+        "how": "mock delete 返回 true → 调用 clearIntentTreeCache → 断言无异常 + verify delete 被调用。",
+        "metrics": [
+          { "label": "delete 调用次数", "expected": "1", "note": "精确清除目标 key" }
+        ]
+      },
+      "tc05_clear_keyAbsent_silentNoOp": {
+        "id": "TC05",
+        "display": "clearIntentTreeCache（key 不存在）→ 静默忽略",
+        "what": "Redis key 不存在时（delete 返回 false），clearIntentTreeCache 静默忽略不报错，保证幂等性。",
+        "how": "mock delete 返回 false → 调用 clearIntentTreeCache → 断言无异常。",
+        "metrics": [
+          { "label": "异常", "expected": "无", "note": "幂等清除，重复调用安全" }
+        ]
+      },
+      "tc06_isCacheExists_reflectsRedisHasKey": {
+        "id": "TC06",
+        "display": "isCacheExists → 正确反映 Redis hasKey 结果",
+        "what": "isCacheExists 直接代理 StringRedisTemplate.hasKey()，返回值与 Redis 真实状态一致，支持多实例判断是否需要重建缓存。",
+        "how": "mock hasKey 返回 true → 断言 true；mock 返回 false → 断言 false。",
+        "metrics": [
+          { "label": "hasKey=true 时返回", "expected": "true", "note": "缓存存在，无需 DB 查询" },
+          { "label": "hasKey=false 时返回", "expected": "false", "note": "触发 DB 重建" }
+        ]
+      },
+      "tc07_redisException_returnsNullSafely": {
+        "id": "TC07",
+        "display": "Redis 异常 → 防御性返回 null，不上抛",
+        "what": "Redis 连接异常时，getIntentTreeFromCache 捕获异常并返回 null，保证意图分类链路不因 Redis 故障完全中断（降级到 DB 加载）。",
+        "how": "mock opsForValue().get() 抛 RuntimeException → 验证无异常上抛 + 返回 null。",
+        "metrics": [
+          { "label": "异常上抛", "expected": "否", "note": "Redis 故障不中断 RAG 链路" },
+          { "label": "返回值", "expected": "null", "note": "调用方降级处理" }
+        ]
+      }
+    }
+  },
+  "RagTraceContextTest": {
+    "title": "挑战四：一致性与可观测性 — RagTraceContext 全链路追踪上下文",
+    "description": "验证基于 TransmittableThreadLocal 的 RAG 全链路追踪上下文：traceId 读写、节点栈 push/pop LIFO 行为、clear() 防泄漏，以及完整五阶段 RAG 流水线（query-rewrite → intent-classify → retrieve → rerank → stream-output）的栈管理正确性。",
+    "cases": {
+      "tc01_freshContext_allNullOrZero": {
+        "id": "TC01",
+        "display": "初始状态：traceId=null，depth=0，currentNodeId=null",
+        "what": "全新线程（或 clear 后）上下文的初始状态：所有字段均为空/零，保证链路隔离。",
+        "how": "清空上下文后直接断言 getTraceId()=null, depth()=0, currentNodeId()=null。",
+        "metrics": [
+          { "label": "getTraceId()", "expected": "null", "note": "无链路" },
+          { "label": "depth()", "expected": "0", "note": "节点栈为空" }
+        ]
+      },
+      "tc02_setAndGetTraceId_roundTrip": {
+        "id": "TC02",
+        "display": "setTraceId / getTraceId 读写闭环",
+        "what": "setTraceId 写入的值可被 getTraceId 完整读取，TTL 内链路 ID 在同线程保持不变。",
+        "how": "setTraceId 写入 → getTraceId() 读取 → 断言值相等。",
+        "metrics": [
+          { "label": "traceId 值", "expected": "trace-20260602-001", "note": "读写一致" }
+        ]
+      },
+      "tc03_pushOneNode_depthAndCurrentNodeCorrect": {
+        "id": "TC03",
+        "display": "pushNode 一次 → depth=1，currentNodeId 正确",
+        "what": "压入第一个节点（如 query-rewrite），depth 变为 1，currentNodeId 指向该节点。",
+        "how": "pushNode(node-query-rewrite) → 断言 depth=1，currentNodeId 正确。",
+        "metrics": [
+          { "label": "depth()", "expected": "1", "note": "第一个阶段节点" },
+          { "label": "currentNodeId()", "expected": "node-query-rewrite", "note": "正确指向当前节点" }
+        ]
+      },
+      "tc04_pushTwoNodes_lifoOrder": {
+        "id": "TC04",
+        "display": "pushNode 两次（LIFO）→ depth=2，currentNodeId = 最后压入",
+        "what": "压入两个节点时，currentNodeId 始终指向栈顶（最新 = 最内层子节点），体现 LIFO 栈语义。",
+        "how": "pushNode(node-intent-classify) → pushNode(node-retrieve) → 断言 depth=2，currentNodeId=node-retrieve。",
+        "metrics": [
+          { "label": "depth()", "expected": "2", "note": "两层嵌套" },
+          { "label": "currentNodeId()", "expected": "node-retrieve", "note": "LIFO 栈顶" }
+        ]
+      },
+      "tc05_popNode_restoresPreviousState": {
+        "id": "TC05",
+        "display": "popNode → depth 递减，currentNodeId 回退到父节点",
+        "what": "popNode 对应一个 RAG 阶段方法结束（@RagTraceNode 切面 finally 块），depth 减少，currentNodeId 回退到父节点，支持 RagTraceAspect 正确记录 parentNodeId。",
+        "how": "push parent + child → popNode → 断言 depth=1，currentNodeId=parent。",
+        "metrics": [
+          { "label": "pop 后 depth()", "expected": "1", "note": "子阶段结束" },
+          { "label": "pop 后 currentNodeId()", "expected": "node-intent-classify", "note": "回到父节点" }
+        ]
+      },
+      "tc06_clear_resetsAllState": {
+        "id": "TC06",
+        "display": "clear() → 全部 ThreadLocal 清零，防线程池泄漏",
+        "what": "RagTraceAspect.aroundRoot 的 finally 块调用 RagTraceContext.clear()，确保线程归还线程池时不携带上一次请求的 traceId 和节点栈，防止幽灵链路。",
+        "how": "setTraceId + pushNode → clear() → 断言 getTraceId=null，depth=0，currentNodeId=null。",
+        "metrics": [
+          { "label": "clear 后 getTraceId()", "expected": "null", "note": "防幽灵链路" },
+          { "label": "clear 后 depth()", "expected": "0", "note": "节点栈彻底清空" }
+        ]
+      },
+      "tc07_fiveStageRagPipeline_stackManagedCorrectly": {
+        "id": "TC07",
+        "display": "五阶段 RAG 链路模拟：query-rewrite→intent-classify→retrieve→rerank→stream-output",
+        "what": "模拟完整 RAG 请求：五个阶段节点依次 push/pop（包含嵌套），全部 pop 后栈空但 traceId 保留，clear() 后完全重置。验证 PPT 所述全链路可追踪性。",
+        "how": "setTraceId → 逐阶段 pushNode/popNode → 断言各阶段 depth/currentNodeId → 最终 clear。",
+        "metrics": [
+          { "label": "rerank 嵌套在 retrieve 内时 depth", "expected": "2", "note": "子阶段正确嵌套" },
+          { "label": "全部 pop 后 depth()", "expected": "0", "note": "无内存泄漏" },
+          { "label": "clear 前 traceId", "expected": "存在", "note": "由 aroundRoot 管理生命周期" }
+        ]
+      }
+    }
+  }
+}

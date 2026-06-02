@@ -1,0 +1,134 @@
+{
+  "DelegatingTransactionListenerTest": {
+    "title": "挑战三：异步解耦 — DelegatingTransactionListener 事务消息状态机",
+    "description": "验证 RocketMQ 事务消息核心状态机：Half 消息落地后执行本地事务（COMMIT/ROLLBACK），Broker 回查走 DB（TransactionChecker）不依赖内存，txId 一次性消费保证幂等，支持多实例水平部署。",
+    "cases": {
+      "tc01_localTransactionSucceeds_returnsCommit": {
+        "id": "TC01",
+        "display": "本地事务执行成功 → COMMIT（消息投递）",
+        "what": "consumer lambda 正常执行完毕时，executeLocalTransaction 应返回 COMMIT，触发 Broker 将 Half 消息投递给消费者。",
+        "how": "注册 txId → 构造带 HEADER_TX_ID 的消息 → 调用 executeLocalTransaction → 断言返回 COMMIT 且 consumer 被调用一次。",
+        "metrics": [
+          { "label": "executeLocalTransaction 返回值", "expected": "COMMIT", "note": "consumer 正常执行无异常" },
+          { "label": "consumer 调用次数", "expected": "1", "note": "AtomicBoolean 校验执行发生" }
+        ]
+      },
+      "tc02_localTransactionThrows_returnsRollback": {
+        "id": "TC02",
+        "display": "本地事务抛 RuntimeException → ROLLBACK（消息丢弃）",
+        "what": "consumer 抛出 RuntimeException 时，executeLocalTransaction 应捕获异常并返回 ROLLBACK，保证 DB 与消息的最终一致性。",
+        "how": "注册抛异常的 consumer → 调用 executeLocalTransaction → 断言返回 ROLLBACK。",
+        "metrics": [
+          { "label": "executeLocalTransaction 返回值", "expected": "ROLLBACK", "note": "异常被捕获，消息安全丢弃" }
+        ]
+      },
+      "tc03_missingTxIdHeader_returnsRollback": {
+        "id": "TC03",
+        "display": "HEADER_TX_ID 缺失 → ROLLBACK（防御性处理）",
+        "what": "消息头中无 HEADER_TX_ID 时，无法定位对应的本地事务逻辑，应立即 ROLLBACK，防止消息在未知状态下被投递。",
+        "how": "构造不含 HEADER_TX_ID 的消息 → 调用 executeLocalTransaction → 断言返回 ROLLBACK。",
+        "metrics": [
+          { "label": "executeLocalTransaction 返回值", "expected": "ROLLBACK", "note": "txId=null，防御性处理" }
+        ]
+      },
+      "tc04_txIdNotRegistered_returnsRollback": {
+        "id": "TC04",
+        "display": "txId 存在但未注册到 map → ROLLBACK",
+        "what": "消息头中有 txId 但 localTransactionMap 中无对应 entry 时（可能因为实例重启或路由错误），应返回 ROLLBACK。",
+        "how": "注册另一个 txId → 使用未注册的 txId 调用 executeLocalTransaction → 断言返回 ROLLBACK。",
+        "metrics": [
+          { "label": "executeLocalTransaction 返回值", "expected": "ROLLBACK", "note": "未注册 txId，无法执行本地事务" }
+        ]
+      },
+      "tc05_afterExecution_txIdRemovedPreventingReplay": {
+        "id": "TC05",
+        "display": "txId 一次性消费：执行后移除，防重放",
+        "what": "executeLocalTransaction 成功后，txId 从 localTransactionMap 移除（ConcurrentMap.remove），第二次相同 txId 调用应返回 ROLLBACK，保证幂等性。",
+        "how": "注册 txId → 首次调用 → 再次调用同一消息 → 断言 consumer 仅执行 1 次，第二次返回 ROLLBACK。",
+        "metrics": [
+          { "label": "首次返回值", "expected": "COMMIT", "note": "consumer 正常执行" },
+          { "label": "consumer 执行次数", "expected": "1", "note": "AtomicInteger 校验唯一性" },
+          { "label": "第二次返回值", "expected": "ROLLBACK", "note": "txId 已被 remove，防止重放" }
+        ]
+      },
+      "tc06_checkerReturnsTrue_checkReturnsCommit": {
+        "id": "TC06",
+        "display": "回查 checker 返回 true → COMMIT",
+        "what": "Broker 发起回查时，找到 topic 对应的 TransactionChecker.check() 返回 true（DB 状态已提交），应返回 COMMIT。",
+        "how": "注册 checker（直接返回 true）→ 构造带 HEADER_TOPIC 的回查消息 → 调用 checkLocalTransaction → 断言 COMMIT。",
+        "metrics": [
+          { "label": "checkLocalTransaction 返回值", "expected": "COMMIT", "note": "checker.check=true，DB 已提交" }
+        ]
+      },
+      "tc07_checkerReturnsFalse_checkReturnsRollback": {
+        "id": "TC07",
+        "display": "回查 checker 返回 false → ROLLBACK",
+        "what": "checker.check() 返回 false 时（DB 中本地事务未提交或已回滚），应返回 ROLLBACK，消息被 Broker 丢弃。",
+        "how": "注册 checker（返回 false）→ 调用 checkLocalTransaction → 断言 ROLLBACK。",
+        "metrics": [
+          { "label": "checkLocalTransaction 返回值", "expected": "ROLLBACK", "note": "checker.check=false，DB 未提交" }
+        ]
+      },
+      "tc08_noCheckerForTopic_checkReturnsRollback": {
+        "id": "TC08",
+        "display": "回查 topic 无 checker → ROLLBACK（保守兜底）",
+        "what": "回查消息携带的 topic 在 checkerMap 中无对应 checker 时（可能配置错误），应保守返回 ROLLBACK，避免持续投递状态未知的消息。",
+        "how": "不注册任何 checker → 调用 checkLocalTransaction（未知 topic）→ 断言 ROLLBACK。",
+        "metrics": [
+          { "label": "checkLocalTransaction 返回值", "expected": "ROLLBACK", "note": "无 checker，保守兜底" }
+        ]
+      }
+    }
+  },
+  "KnowledgeDocumentChunkTransactionCheckerTest": {
+    "title": "挑战三：异步解耦 — KnowledgeDocumentChunkTransactionChecker 回查逻辑",
+    "description": "验证基于 DB 状态的 Broker 回查实现：仅 RUNNING 状态返回 true 触发 COMMIT，其他状态（SUCCESS/PENDING/文档不存在）均返回 false。体现多实例水平扩展的核心：回查不依赖内存，走 DB 查询。",
+    "cases": {
+      "tcC01_statusRunning_returnsTrue": {
+        "id": "TC-C01",
+        "display": "文档状态 RUNNING → check 返回 true",
+        "what": "DB 中文档状态为 RUNNING（本地事务已提交更新状态），回查应返回 true，指示 Broker COMMIT 消息投递给消费者。",
+        "how": "mock documentMapper.selectById 返回 RUNNING 状态文档 → 调用 check → 断言返回 true。",
+        "metrics": [
+          { "label": "check 返回值", "expected": "true", "note": "RUNNING 是本地事务已提交的唯一凭证" }
+        ]
+      },
+      "tcC02_statusSuccess_returnsFalse": {
+        "id": "TC-C02",
+        "display": "文档状态 SUCCESS → check 返回 false",
+        "what": "文档已处理完成（SUCCESS），此时再投递消息会导致重复处理，应保守返回 false。",
+        "how": "mock 返回 SUCCESS 状态文档 → 调用 check → 断言返回 false。",
+        "metrics": [
+          { "label": "check 返回值", "expected": "false", "note": "SUCCESS 非 RUNNING，ROLLBACK 丢弃" }
+        ]
+      },
+      "tcC03_statusPending_returnsFalse": {
+        "id": "TC-C03",
+        "display": "文档状态 PENDING → check 返回 false",
+        "what": "文档仍为 PENDING（本地事务尚未执行或已回滚未更新状态），应 ROLLBACK 丢弃消息，不触发消费者。",
+        "how": "mock 返回 PENDING 状态文档 → 调用 check → 断言返回 false。",
+        "metrics": [
+          { "label": "check 返回值", "expected": "false", "note": "PENDING：本地事务未完成" }
+        ]
+      },
+      "tcC04_documentNotFound_returnsFalse": {
+        "id": "TC-C04",
+        "display": "文档不存在（DB null）→ check 返回 false",
+        "what": "documentMapper.selectById 返回 null 时（文档被删除或 docId 错误），null 安全检查应返回 false，防止 NPE 并保守丢弃孤儿消息。",
+        "how": "mock 返回 null → 调用 check → 断言返回 false。",
+        "metrics": [
+          { "label": "check 返回值", "expected": "false", "note": "null 安全，防止 NPE" }
+        ]
+      },
+      "tcC05_endToEnd_checkerRegisteredAndRouted": {
+        "id": "TC-C05",
+        "display": "端到端：checker 注册 → topic 路由 → COMMIT",
+        "what": "验证从 registerChecker 到 DelegatingTransactionListener.checkLocalTransaction 的完整路由链路：消息携带正确 topic，DB 返回 RUNNING，最终状态机返回 COMMIT。",
+        "how": "创建 DelegatingTransactionListener → registerChecker → mock DB 返回 RUNNING → 构造 HEADER_TOPIC 消息 → 调用 checkLocalTransaction → 断言 COMMIT。",
+        "metrics": [
+          { "label": "checkLocalTransaction 返回值", "expected": "COMMIT", "note": "端到端路由正确，DB 状态驱动" }
+        ]
+      }
+    }
+  }
+}

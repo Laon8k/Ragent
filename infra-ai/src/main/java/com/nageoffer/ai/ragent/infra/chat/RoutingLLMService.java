@@ -23,6 +23,7 @@ import com.nageoffer.ai.ragent.framework.errorcode.BaseErrorCode;
 import com.nageoffer.ai.ragent.framework.exception.RemoteException;
 import com.nageoffer.ai.ragent.framework.trace.RagTraceNode;
 import com.nageoffer.ai.ragent.infra.enums.ModelCapability;
+import com.nageoffer.ai.ragent.infra.model.ModelConcurrencyStore;
 import com.nageoffer.ai.ragent.infra.model.ModelHealthStore;
 import com.nageoffer.ai.ragent.infra.model.ModelRoutingExecutor;
 import com.nageoffer.ai.ragent.infra.model.ModelSelector;
@@ -32,6 +33,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -57,16 +59,19 @@ public class RoutingLLMService implements LLMService {
     private final ModelSelector selector;
     private final ModelHealthStore healthStore;
     private final ModelRoutingExecutor executor;
+    private final ModelConcurrencyStore concurrencyStore;
     private final Map<String, ChatClient> clientsByProvider;
 
     public RoutingLLMService(
             ModelSelector selector,
             ModelHealthStore healthStore,
             ModelRoutingExecutor executor,
+            ModelConcurrencyStore concurrencyStore,
             List<ChatClient> clients) {
         this.selector = selector;
         this.healthStore = healthStore;
         this.executor = executor;
+        this.concurrencyStore = concurrencyStore;
         this.clientsByProvider = clients.stream()
                 .collect(Collectors.toMap(ChatClient::provider, Function.identity()));
     }
@@ -105,7 +110,9 @@ public class RoutingLLMService implements LLMService {
 
         String label = ModelCapability.CHAT.getDisplayName();
         Throwable lastError = null;
+        List<ModelTarget> capacityDeferred = new ArrayList<>();
 
+        // 第一轮：只调用有容量的模型
         for (ModelTarget target : targets) {
             ChatClient client = resolveClient(target, label);
             if (client == null) {
@@ -114,44 +121,133 @@ public class RoutingLLMService implements LLMService {
             if (!healthStore.allowCall(target.id())) {
                 continue;
             }
+            int maxConcurrent = resolveMaxConcurrent(target);
+            if (!concurrencyStore.tryAcquire(target.id(), maxConcurrent)) {
+                log.debug("{} model at capacity, deferring. modelId={}", label, target.id());
+                capacityDeferred.add(target);
+                continue;
+            }
+            StreamCancellationHandle handle = tryStream(request, callback, target, maxConcurrent, label, false);
+            if (handle != null) {
+                return handle;
+            }
+            lastError = LAST_ERROR_SENTINEL;
+        }
 
-            ProbeStreamBridge bridge = new ProbeStreamBridge(callback);
+        // 第二轮：所有候选均满时强制尝试
+        for (ModelTarget target : capacityDeferred) {
+            ChatClient client = resolveClient(target, label);
+            if (client == null) {
+                continue;
+            }
+            if (!healthStore.allowCall(target.id())) {
+                continue;
+            }
+            int maxConcurrent = resolveMaxConcurrent(target);
+            StreamCancellationHandle handle = tryStream(request, callback, target, maxConcurrent, label, true);
+            if (handle != null) {
+                return handle;
+            }
+            lastError = LAST_ERROR_SENTINEL;
+        }
 
+        throw notifyAllFailed(callback, lastError);
+    }
+
+    /**
+     * 尝试对单个 target 发起流式调用。
+     * force=true 时跳过容量检查直接强制占位（兜底路径）。
+     * 返回非 null 的 handle 表示成功，null 表示失败需继续尝试下一个。
+     */
+    private StreamCancellationHandle tryStream(ChatRequest request, StreamCallback callback,
+                                               ModelTarget target, int maxConcurrent,
+                                               String label, boolean force) {
+        if (force) {
+            concurrencyStore.forceAcquire(target.id(), maxConcurrent);
+        }
+
+        // 流结束时（onComplete/onError）自动释放槽位
+        StreamCallback releasing = wrapWithRelease(callback, target.id(), maxConcurrent);
+        ProbeStreamBridge bridge = new ProbeStreamBridge(releasing);
+
+        boolean slotHeld = false;
+        try {
             StreamCancellationHandle handle;
             try {
-                handle = client.streamChat(request, bridge, target);
+                handle = clientsByProvider.get(target.candidate().getProvider())
+                        .streamChat(request, bridge, target);
             } catch (Exception e) {
                 healthStore.markFailure(target.id());
-                lastError = e;
                 log.warn("{} 流式请求启动失败，切换下一个模型。modelId：{}，provider：{}",
                         label, target.id(), target.candidate().getProvider(), e);
-                continue;
+                return null;
             }
             if (handle == null) {
                 healthStore.markFailure(target.id());
-                lastError = new RemoteException(STREAM_START_FAILED_MESSAGE, BaseErrorCode.REMOTE_ERROR);
                 log.warn("{} 流式请求未返回取消句柄，切换下一个模型。modelId：{}，provider：{}",
                         label, target.id(), target.candidate().getProvider());
-                continue;
+                return null;
             }
 
             ProbeStreamBridge.ProbeResult result = awaitFirstPacket(bridge, handle, callback);
 
             if (result.isSuccess()) {
                 healthStore.markSuccess(target.id());
+                slotHeld = true; // 槽位由 releasing 包装器在流结束时释放
                 return handle;
             }
 
-            // 失败处理
             healthStore.markFailure(target.id());
             handle.cancel();
+            buildLastErrorAndLog(result, target, label);
+            return null;
 
-            lastError = buildLastErrorAndLog(result, target, label);
+        } finally {
+            // slotHeld=true 说明流已成功启动，槽位由 releasing 包装器负责释放；否则在此兜底
+            if (!slotHeld) {
+                concurrencyStore.release(target.id(), maxConcurrent);
+            }
         }
-
-        // 所有模型都失败了，通知客户端错误
-        throw notifyAllFailed(callback, lastError);
     }
+
+    private StreamCallback wrapWithRelease(StreamCallback delegate, String modelId, int maxConcurrent) {
+        return new StreamCallback() {
+            @Override
+            public void onContent(String content) {
+                delegate.onContent(content);
+            }
+
+            @Override
+            public void onThinking(String content) {
+                delegate.onThinking(content);
+            }
+
+            @Override
+            public void onComplete() {
+                try {
+                    delegate.onComplete();
+                } finally {
+                    concurrencyStore.release(modelId, maxConcurrent);
+                }
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                try {
+                    delegate.onError(error);
+                } finally {
+                    concurrencyStore.release(modelId, maxConcurrent);
+                }
+            }
+        };
+    }
+
+    private static int resolveMaxConcurrent(ModelTarget target) {
+        Integer max = target.candidate().getMaxConcurrent();
+        return max != null ? max : 0;
+    }
+
+    private static final Throwable LAST_ERROR_SENTINEL = new RuntimeException("model routing failed");
 
     private ChatClient resolveClient(ModelTarget target, String label) {
         ChatClient client = clientsByProvider.get(target.candidate().getProvider());

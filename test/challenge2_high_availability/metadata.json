@@ -1,0 +1,162 @@
+{
+  "ModelCircuitBreakerTest": {
+    "title": "挑战二：高可用 — 三态熔断器与路由故障转移",
+    "description": "验证 ModelHealthStore 三态熔断器（CLOSED → OPEN → HALF_OPEN）的完整状态机，以及 ModelRoutingExecutor 在首选模型失败时的自动故障转移能力。使用真实对象（无 Mock），通过 markFailure / markSuccess / allowCall 直接驱动状态迁移，保证熔断器行为与生产逻辑完全一致。",
+    "cases": {
+      "tc01_freshModel_allowedByDefault": {
+        "id": "TC01",
+        "display": "初始状态 CLOSED，allowCall=true",
+        "what": "从未被调用过的模型，健康状态默认 CLOSED，allowCall 返回 true，isUnavailable 返回 false。",
+        "how": "直接对全新 ModelHealthStore 调用 allowCall(\"brand-new-model\")，断言返回 true；再断言 isUnavailable=false。",
+        "metrics": [
+          {"label": "allowCall 返回值",   "expected": "true",  "note": "CLOSED 初始允许调用"},
+          {"label": "isUnavailable 返回值","expected": "false", "note": "未熔断不应标记不可用"}
+        ]
+      },
+      "tc02_singleFailureBelowThreshold_staysClosed": {
+        "id": "TC02",
+        "display": "1 次失败 < 阈值，保持 CLOSED",
+        "what": "markFailure 1 次（< failureThreshold=2），熔断器不应打开，allowCall 仍返回 true。",
+        "how": "markFailure 1 次后断言 allowCall=true、isUnavailable=false。",
+        "metrics": [
+          {"label": "连续失败次数",   "expected": "1 < 2",  "note": "低于阈值"},
+          {"label": "allowCall 返回值","expected": "true",   "note": "未触发熔断"}
+        ]
+      },
+      "tc03_consecutiveFailuresReachThreshold_opensCircuit": {
+        "id": "TC03",
+        "display": "连续失败 ≥ 阈值：CLOSED → OPEN",
+        "what": "连续 markFailure 达到 failureThreshold(=2)，熔断器打开，allowCall=false，isUnavailable=true。",
+        "how": "triggerOpen（markFailure×2），断言 allowCall=false 且 isUnavailable=true。",
+        "metrics": [
+          {"label": "allowCall 返回值",    "expected": "false", "note": "OPEN 状态阻止调用"},
+          {"label": "isUnavailable 返回值", "expected": "true",  "note": "OPEN 标记不可用"}
+        ]
+      },
+      "tc04_whileOpen_repeatedCallsAllRejected": {
+        "id": "TC04",
+        "display": "OPEN 期间持续拒绝调用",
+        "what": "OPEN 状态（openUntil 未过期）下，多次 allowCall 均应返回 false，保证熔断期间零漏调用。",
+        "how": "triggerOpen 后连续调用 allowCall 3 次，逐次断言返回 false。",
+        "metrics": [
+          {"label": "连续拒绝次数", "expected": "= 3",  "note": "OPEN 持续保护"},
+          {"label": "漏过的调用数", "expected": "= 0",  "note": "零漏调用"}
+        ]
+      },
+      "tc05_openExpired_halfOpenAllowsOneProbe": {
+        "id": "TC05",
+        "display": "OPEN 到期 → HALF_OPEN：首次 probe=true，第二次 in-flight 保护=false",
+        "what": "OPEN 持续时间到期后，首次 allowCall 触发 HALF_OPEN 并允许单次探测；同一 ID 第二次 allowCall 因 halfOpenInFlight=true 被阻断，防止并发探测污染结果。",
+        "how": "使用 openDurationMs=-1000（立即过期），triggerOpen 后连续两次 allowCall，断言 [true, false]。",
+        "metrics": [
+          {"label": "首次 allowCall",   "expected": "true",  "note": "HALF_OPEN probe 开放"},
+          {"label": "第二次 allowCall", "expected": "false", "note": "in-flight 保护，防并发探测"}
+        ]
+      },
+      "tc06_halfOpenSuccess_recoversToClose": {
+        "id": "TC06",
+        "display": "HALF_OPEN 成功 → CLOSED 完全恢复",
+        "what": "HALF_OPEN probe 期间 markSuccess，熔断器恢复 CLOSED，consecutiveFailures 归零，allowCall=true，isUnavailable=false。",
+        "how": "expiredStore 触发 HALF_OPEN 后 markSuccess，断言 allowCall=true 且 isUnavailable=false。",
+        "metrics": [
+          {"label": "allowCall 恢复值",    "expected": "true",  "note": "CLOSED 正常调用"},
+          {"label": "isUnavailable 恢复值","expected": "false", "note": "不再标记不可用"},
+          {"label": "consecutiveFailures", "expected": "= 0",   "note": "计数重置"}
+        ]
+      },
+      "tc07_halfOpenFailure_reOpensAndResetsInFlight": {
+        "id": "TC07",
+        "display": "HALF_OPEN 失败 → 重新熔断，halfOpenInFlight 重置",
+        "what": "HALF_OPEN probe 失败时，熔断器重新 OPEN，halfOpenInFlight 被重置为 false。下一次 OPEN 过期后，新 probe 可再次发出（证明 in-flight 状态被正确清除，不会永久阻塞探测）。",
+        "how": "expiredStore 中：allowCall→HALF_OPEN → 验证第二次被阻断 → markFailure → 再次 allowCall 应返回 true（OPEN 再次立即过期，in-flight 已重置）。",
+        "metrics": [
+          {"label": "第一轮 probe",       "expected": "true",  "note": "首次 HALF_OPEN 允许"},
+          {"label": "in-flight 保护",     "expected": "false", "note": "第二次同轮被阻断"},
+          {"label": "markFailure 后 probe","expected": "true",  "note": "in-flight 重置后新 probe 放行"}
+        ]
+      },
+      "tc08_primaryModelFails_routerFallsBackToStandby": {
+        "id": "TC08",
+        "display": "路由执行器：首选模型抛异常，自动故障转移到备用模型",
+        "what": "ModelRoutingExecutor.executeWithFallback 在首选模型抛出异常后，自动迭代到下一个候选模型并返回其响应，实现透明故障转移；同时验证失败次数在阈值内时首选模型未进入熔断。",
+        "how": "传入 [primary, standby] 候选列表，caller 对 primary 抛 RuntimeException，对 standby 返回字符串；断言返回值来自 standby，primary/standby 的 allowCall 均为 true。",
+        "metrics": [
+          {"label": "返回值来源",           "expected": "备用模型",  "note": "透明切换，用户无感"},
+          {"label": "primary 失败次数",     "expected": "1 < 阈值 2","note": "未触发熔断"},
+          {"label": "standby allowCall 值", "expected": "true",      "note": "成功调用后健康状态正常"}
+        ]
+      }
+    }
+  },
+  "ProbeStreamBridgeTest": {
+    "title": "挑战二：高可用 — ProbeStreamBridge 首包探测",
+    "description": "验证 ProbeStreamBridge 的四种探测结果（SUCCESS / ERROR / NO_CONTENT / TIMEOUT）及缓冲-提交机制。核心设计：流式首包到达后先缓冲，确认模型可用（SUCCESS）后再向下游提交；ERROR / NO_CONTENT / TIMEOUT 时不 commit，downstream 不收到任何数据，从根本上防止脏数据外泄给用户。",
+    "cases": {
+      "tcP01_onContent_successProbeAndDownstreamNotified": {
+        "id": "TC-P01",
+        "display": "onContent → SUCCESS probe，downstream.onContent 被调用",
+        "what": "onContent 触发后，awaitFirstPacket 返回 SUCCESS，commit 发生，downstream.onContent 被调用，内容与原始一致。",
+        "how": "先调 bridge.onContent(\"hello\")，再 awaitFirstPacket(1s)；断言 result.isSuccess() 且 verify(downstream).onContent(\"hello\")。",
+        "metrics": [
+          {"label": "probe 类型",           "expected": "SUCCESS",     "note": "内容到达即成功"},
+          {"label": "downstream.onContent", "expected": "调用 1 次",   "note": "commit 后分发"},
+          {"label": "内容正确性",           "expected": "\"hello\"",    "note": "原始内容不变"}
+        ]
+      },
+      "tcP02_onError_errorProbeAndDownstreamNotNotified": {
+        "id": "TC-P02",
+        "display": "onError → ERROR probe，downstream 不收到任何通知（防脏数据外泄）",
+        "what": "onError 触发后 probe 为 ERROR，commit 不发生，downstream.onError / onContent / onComplete 均不被调用，错误信息可从 result.getError() 获取。",
+        "how": "bridge.onError(exception)，awaitFirstPacket；断言 result.type=ERROR，result.error=原始异常；verify(downstream, never()).onError/onContent/onComplete。",
+        "metrics": [
+          {"label": "probe 类型",            "expected": "ERROR",       "note": "错误即探测失败"},
+          {"label": "downstream 调用次数",   "expected": "= 0",         "note": "未 commit，不外泄"},
+          {"label": "result.getError()",     "expected": "原始异常对象", "note": "上层可获取错误详情"}
+        ]
+      },
+      "tcP03_onCompleteWithoutContent_noContentProbeAndDownstreamSilent": {
+        "id": "TC-P03",
+        "display": "onComplete（无内容）→ NO_CONTENT probe，downstream 不被调用",
+        "what": "onComplete 先于任何 onContent 时，模型无实质输出，probe 为 NO_CONTENT，commit 不发生，downstream 静默。",
+        "how": "bridge.onComplete()，awaitFirstPacket；断言 result.type=NO_CONTENT；verify(downstream, never()).onComplete / onContent。",
+        "metrics": [
+          {"label": "probe 类型",          "expected": "NO_CONTENT", "note": "无内容即探测失败"},
+          {"label": "downstream 调用次数", "expected": "= 0",        "note": "未 commit，防空推送"}
+        ]
+      },
+      "tcP04_noEvent_timeoutProbeReturned": {
+        "id": "TC-P04",
+        "display": "无任何事件：awaitFirstPacket 超时返回 TIMEOUT",
+        "what": "在指定超时（50ms）内无任何事件触发时，awaitFirstPacket 返回 TIMEOUT，不阻塞调用线程超出预设时间，确保故障转移可及时触发。",
+        "how": "不触发任何事件，awaitFirstPacket(50, MILLISECONDS)；断言 result.type=TIMEOUT，result.isSuccess()=false。",
+        "metrics": [
+          {"label": "probe 类型",       "expected": "TIMEOUT",   "note": "超时触发故障转移"},
+          {"label": "isSuccess()",      "expected": "false",     "note": "不提交缓冲"},
+          {"label": "最大阻塞时间",     "expected": "≈ 50ms",    "note": "快速响应超时"}
+        ]
+      },
+      "tcP05_multipleTokensBufferedAndFlushedInOrder": {
+        "id": "TC-P05",
+        "display": "多 token 缓冲：SUCCESS commit 后按序全量分发，无丢失无乱序",
+        "what": "多个 onContent + onComplete 在 awaitFirstPacket 之前到达（全部缓冲），SUCCESS 后 commit，downstream 按入队顺序收到全量内容（token-1/2/3 + complete），证明首包探测机制不丢数据。",
+        "how": "先调 bridge.onContent×3 和 onComplete，awaitFirstPacket；断言 result.isSuccess() 且 received.containsExactly(token-1, token-2, token-3, __complete__)。",
+        "metrics": [
+          {"label": "缓冲 token 数量",    "expected": "= 3",      "note": "所有 token 入缓冲"},
+          {"label": "downstream 收到内容", "expected": "按序全量", "note": "containsExactly 严格有序"},
+          {"label": "complete 事件",       "expected": "正确到达", "note": "尾部事件不丢失"}
+        ]
+      },
+      "tcP06_afterCommit_subsequentContentDispatchedDirectly": {
+        "id": "TC-P06",
+        "display": "commit 后新到 token 直接分发，不再经过 buffer",
+        "what": "SUCCESS commit 之后，后续到达的 onContent 不再进入 buffer 而是直接分发给 downstream，确保流式 token 的实时性不因 commit 机制受损。",
+        "how": "首包 awaitFirstPacket（commit），随后异步发出两个 onContent；Thread.sleep(100ms) 后断言 downstream 收到全部 3 个 token。",
+        "metrics": [
+          {"label": "post-commit token 数量", "expected": "= 2",    "note": "commit 后无延迟"},
+          {"label": "总收到 token 数量",      "expected": "= 3",    "note": "首包 + 后续全部到达"},
+          {"label": "实时性",                 "expected": "直接分发","note": "绕过 buffer 路径"}
+        ]
+      }
+    }
+  }
+}

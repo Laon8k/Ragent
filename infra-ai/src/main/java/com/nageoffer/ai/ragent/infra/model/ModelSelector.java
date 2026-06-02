@@ -41,6 +41,7 @@ public class ModelSelector {
 
     private final AIModelProperties properties;
     private final ModelHealthStore healthStore;
+    private final ModelConcurrencyStore concurrencyStore;
 
     public List<ModelTarget> selectChatCandidates(boolean deepThinking) {
         AIModelProperties.ModelGroup group = properties.getChat();
@@ -98,8 +99,12 @@ public class ModelSelector {
                 .filter(c -> c != null && !Boolean.FALSE.equals(c.getEnabled()))
                 .filter(c -> !deepThinking || Boolean.TRUE.equals(c.getSupportsThinking()))
                 .sorted(Comparator
-                        .comparing((AIModelProperties.ModelCandidate c) ->
-                                !Objects.equals(resolveId(c), firstChoiceModelId))
+                        // 有容量的模型排在前面（false < true，hasCapacity=true → !hasCapacity=false → 靠前）
+                        .comparing((AIModelProperties.ModelCandidate c) -> {
+                            int max = c.getMaxConcurrent() != null ? c.getMaxConcurrent() : 0;
+                            return !concurrencyStore.hasCapacity(resolveId(c), max);
+                        })
+                        .thenComparing(c -> !Objects.equals(resolveId(c), firstChoiceModelId))
                         .thenComparing(AIModelProperties.ModelCandidate::getPriority,
                                 Comparator.nullsLast(Integer::compareTo))
                         .thenComparing(AIModelProperties.ModelCandidate::getId,

@@ -134,6 +134,11 @@ public class AIModelProperties {
          * 是否支持思考链功能
          */
         private Boolean supportsThinking = false;
+
+        /**
+         * 单实例最大并发数，0 表示不限制
+         */
+        private Integer maxConcurrent = 0;
     }
 
     /**

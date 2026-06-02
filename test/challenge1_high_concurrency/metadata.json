@@ -1,0 +1,159 @@
+{
+  "ChatQueueLimiterTest": {
+    "title": "挑战一：高并发 — ChatQueueLimiter 单元测试",
+    "description": "验证 ChatQueueLimiter 在限流关闭、许可充足、许可耗尽、超时拒绝、并发上限等全部分支路径下的正确行为。使用 Mockito 5 对 Redisson、SSE、业务依赖全量 mock，syncExecutor 保证测试确定性。",
+    "cases": {
+      "tc01_whenGlobalDisabled_onAcquireCalledDirectly": {
+        "id": "TC01",
+        "display": "限流关闭时请求直通",
+        "what": "globalEnabled=false 时，enqueue() 应跳过所有限流逻辑，直接调用 onAcquire，且不与 Redis 产生任何交互。",
+        "how": "将 rateLimitProperties.getGlobalEnabled() mock 为 false，调用 enqueue()，断言 onAcquire 计数器 == 1；用 verify(zset, never()).add() 和 verify(semaphore, never()).tryAcquire() 确认零 Redis 写入。",
+        "metrics": [
+          {"label": "onAcquire 执行次数", "expected": "= 1", "note": "直通执行"},
+          {"label": "ZSet 写入次数",      "expected": "= 0", "note": "不入队"},
+          {"label": "信号量调用次数",     "expected": "= 0", "note": "不消耗许可"}
+        ]
+      },
+      "tc02_whenPermitsAvailable_immediateExecution": {
+        "id": "TC02",
+        "display": "有空闲许可时立即执行",
+        "what": "availablePermits > 0 且 Lua claim 成功时，请求无需排队，onAcquire 在 enqueue() 返回前同步执行。",
+        "how": "mock availablePermits()=3，stubEvalSuccess 返回 [1,'1.0']，doReturn 使 tryAcquire 返回 permit-abc；断言 onAcquire 计数器 == 1。",
+        "metrics": [
+          {"label": "onAcquire 执行次数", "expected": "= 1", "note": "同步立即执行"},
+          {"label": "排队等待时间",       "expected": "= 0 ms", "note": "无需入队"},
+          {"label": "Lua claim 结果",     "expected": "[1, 1.0]", "note": "队头 claim 成功"}
+        ]
+      },
+      "tc03_whenNoPermits_requestEnqueued": {
+        "id": "TC03",
+        "display": "许可耗尽时进入 ZSet 排队",
+        "what": "availablePermits == 0 时，请求应以递增 score 写入 Redis ZSet，等待后续调度。",
+        "how": "mock availablePermits()=0，调用 enqueue()，用 ArgumentCaptor 捕获 zset.add(score, id) 的入参，断言 score >= 1.0（由 atomicLong.incrementAndGet() 保证递增）且 requestId 不为空。",
+        "metrics": [
+          {"label": "ZSet 写入次数",   "expected": ">= 1",  "note": "必须入队"},
+          {"label": "Score 来源",      "expected": "原子递增", "note": "保证全局唯一、单调递增"},
+          {"label": "onAcquire 执行", "expected": "= 0",   "note": "未获得许可，不执行"}
+        ]
+      },
+      "tc04_whenTimeoutExceeded_sseEventsInOrder": {
+        "id": "TC04",
+        "display": "超时后 SSE 事件顺序正确",
+        "what": "请求在 ZSet 中等待超过 maxWaitSeconds 后，SSE 应按固定顺序推送 4 个事件：meta → reject → finish → done，不得乱序。",
+        "how": "maxWaitSeconds=0，availablePermits=0，spy emitter 拦截 send(SseEventBuilder)，从 DataWithMediaType 解析 event 名（兼容 Spring 6.2 合并格式），用 Awaitility 等待最多 2s 收齐 4 个事件后断言顺序。",
+        "metrics": [
+          {"label": "SSE 事件数量",    "expected": "= 4",   "note": "meta/reject/finish/done"},
+          {"label": "事件顺序",        "expected": "严格有序", "note": "containsExactly 断言"},
+          {"label": "超时检测延迟",    "expected": "≤ pollInterval(100ms)", "note": "调度器轮询粒度"}
+        ]
+      },
+      "tc05_rejectSseSentBeforeAsyncPersist": {
+        "id": "TC05",
+        "display": "拒绝 SSE 先于异步落库",
+        "what": "拒绝路径的核心设计：emitter.complete()（客户端响应）必须先于 memoryService.append()（DB 落库）执行，避免高并发下 DB 延迟拖慢客户端响应。",
+        "how": "使用独立线程池 asyncExecutor（非 syncExecutor），doAnswer 分别在 emitter.complete() 和 memoryService.append() 写入 CopyOnWriteArrayList；Awaitility 等待 sse_complete 出现，断言其 index < db_persist 的 index。",
+        "metrics": [
+          {"label": "sse_complete 先于 db_persist", "expected": "index 严格小于", "note": "调用顺序断言"},
+          {"label": "异步解耦",                     "expected": "true",           "note": "DB 不阻塞 SSE"},
+          {"label": "最大等待时间",                 "expected": "≤ 2s",           "note": "Awaitility 超时保护"}
+        ]
+      },
+      "tc06_onEmitterCompletion_permitReleasedAndQueueNotified": {
+        "id": "TC06",
+        "display": "Emitter 完成时释放信号量并发布通知",
+        "what": "请求的 SseEmitter 完成（正常结束/超时/错误）后，系统必须：① 归还 Redisson 信号量许可；② 向 topic 发布通知唤醒队列中等待的下一个请求。",
+        "how": "spy emitter，ArgumentCaptor 捕获 onCompletion 回调（Spring 单元测试无 HTTP handler，complete() 不触发回调，需手动 run()）；执行后 verify semaphore.release('permit-xyz') 和 topic.publish() 各至少调用 1 次。",
+        "metrics": [
+          {"label": "信号量 release 调用",  "expected": ">= 1 次", "note": "许可不泄漏"},
+          {"label": "topic.publish 调用",   "expected": ">= 1 次", "note": "唤醒等待者"},
+          {"label": "permit ID 精确匹配",   "expected": "'permit-xyz'", "note": "释放正确的许可"}
+        ]
+      },
+      "tc07_whenLuaClaimFails_onAcquireNotCalled": {
+        "id": "TC07",
+        "display": "Lua claim 非队头时失败，不消耗信号量",
+        "what": "当 Lua 脚本返回 {0}（requestId 的 rank >= maxRank，即非队头）时，系统不应消耗信号量许可，onAcquire 不应被执行，保证公平 FIFO 语义。",
+        "how": "mock availablePermits()=1，stubEvalSuccess 返回 [0L]（claim 失败），调用 enqueue()；verify(semaphore, never()).tryAcquire() 确认许可未消耗，acquired.get() == 0 确认 onAcquire 未执行。",
+        "metrics": [
+          {"label": "onAcquire 执行次数",  "expected": "= 0",   "note": "非队头不可执行"},
+          {"label": "信号量 tryAcquire",   "expected": "= 0 次", "note": "不消耗许可"},
+          {"label": "公平性保证",          "expected": "FIFO",   "note": "只有队头可 claim"}
+        ]
+      },
+      "tc08_concurrentRequests_neverExceedMaxConcurrent": {
+        "id": "TC08",
+        "display": "100 并发请求峰值不超过 globalMaxConcurrent",
+        "what": "同时发起 100 个并发请求，无论调度如何，系统实际并发执行数的峰值必须 ≤ globalMaxConcurrent(50)，验证信号量的并发上限约束有效。",
+        "how": "用真实 java.util.concurrent.Semaphore(50) 替换 Redisson mock，AtomicInteger 追踪 currentActive 并实时更新 peakActive；onAcquire 内 sleep 30ms 拉长持有时间放大竞争；CountDownLatch startGate 保证 100 个线程同时起跑；allDone.await(15s) 收尾。",
+        "metrics": [
+          {"label": "总并发请求数",        "expected": "= 100", "note": "满载压测"},
+          {"label": "峰值并发执行数",      "expected": "≤ 50",  "note": "globalMaxConcurrent 约束"},
+          {"label": "至少完成请求数",      "expected": "> 0",   "note": "系统正常处理"},
+          {"label": "测试超时保护",        "expected": "15s",   "note": "allDone 最大等待时间"}
+        ]
+      }
+    }
+  },
+  "LuaAtomicClaimTest": {
+    "title": "挑战一：高并发 — Lua 原子 claim 脚本验证",
+    "description": "直接对真实 Redis 执行 CLAIM_LUA 脚本，验证公平 FIFO 排队队列的原子 claim 逻辑：miss 检测、rank 越界拒绝、队头成功 claim 并移除、10 线程并发原子性保证、以及按 score 顺序全量推进队列。测试使用本地 Redis（127.0.0.1:6379），每用例前仅删除测试专用 key，不影响其他数据。",
+    "cases": {
+      "tcL01_notInQueue_returnsMiss": {
+        "id": "TC-L01",
+        "display": "requestId 不在 ZSet 时 Lua 返回 {0}（miss）",
+        "what": "当 requestId 根本不存在于 ZSet 中时，ZRANK 返回 nil，Lua 脚本应立即返回 {0}，不对 ZSet 做任何写操作。",
+        "how": "空队列直接 eval CLAIM_LUA，传入不存在的 ghost-id，断言返回列表 containsExactly(0L)。",
+        "metrics": [
+          {"label": "返回值",         "expected": "[0]",  "note": "rank=nil → miss"},
+          {"label": "ZSet 写操作",    "expected": "= 0",  "note": "不做 ZREM"},
+          {"label": "Lua 分支",       "expected": "nil 分支", "note": "rank not found"}
+        ]
+      },
+      "tcL02_rankExceedsMaxRank_returnsMiss": {
+        "id": "TC-L02",
+        "display": "rank >= maxRank 时返回 {0}（非队头不可 claim）",
+        "what": "队列中有 5 个请求，maxRank=2，仅允许前 2 名（rank 0/1）claim。rank=4 的 req-4 超出范围，Lua 应返回 {0} 且不将其从队列移除。",
+        "how": "zadd 5 条记录（score 0~4），eval CLAIM_LUA 传 req-4/maxRank=2；断言返回 [0]，并 zscore(req-4) 不为 null（仍在队列）。",
+        "metrics": [
+          {"label": "返回值",           "expected": "[0]",      "note": "rank=4 >= maxRank=2"},
+          {"label": "req-4 是否保留",   "expected": "仍在 ZSet", "note": "未被 ZREM"},
+          {"label": "ZSet 大小变化",    "expected": "= 5（不变）", "note": "无移除操作"}
+        ]
+      },
+      "tcL03_queueHead_claimSucceeds": {
+        "id": "TC-L03",
+        "display": "rank=0 < maxRank=1 时 claim 成功，返回 {1, score}，requestId 从 ZSet 移除",
+        "what": "队列有两条记录，req-head(score=42) 位于 rank=0，maxRank=1，应成功 claim：返回 [1, '42']，req-head 从 ZSet 移除，req-second 留存不受影响。",
+        "how": "zadd req-head(42)/req-second(43)，eval 传 req-head/maxRank=1；断言 result[0]==1L、Double.parseDouble(result[1])==42.0、zscore(req-head)==null、zscore(req-second)==43.0。",
+        "metrics": [
+          {"label": "返回值[0]",        "expected": "1L",   "note": "claim 成功标志"},
+          {"label": "返回值[1]（score）","expected": "42.0", "note": "原始入队 score"},
+          {"label": "req-head 是否移除", "expected": "已移除", "note": "ZREM 执行"},
+          {"label": "req-second 是否保留","expected": "仍在", "note": "不影响其他成员"}
+        ]
+      },
+      "tcL04_concurrentClaim_onlyOneSucceeds": {
+        "id": "TC-L04",
+        "display": "10 线程并发 claim 同一 requestId，只有 1 个成功（Lua 原子性保证）",
+        "what": "Lua eval 在 Redis 中是原子执行的，10 个线程同时 claim shared-req，只有第一个 ZRANK 检查通过并 ZREM 的线程返回 {1, score}，其余 9 个因 ZRANK 返回 nil（已被移除）而返回 {0}。",
+        "how": "zadd shared-req(1.0)，CountDownLatch startLatch 控制 10 线程同时起跑，每线程独立 Jedis 连接执行 eval；AtomicInteger 累计 result[0]==1 的次数；doneLatch 等待全部完成后断言 successCount==1。",
+        "metrics": [
+          {"label": "claim 成功次数",   "expected": "= 1",    "note": "Lua 原子性保证"},
+          {"label": "并发线程数",       "expected": "10",     "note": "满载并发起跑"},
+          {"label": "claim 失败次数",   "expected": "= 9",    "note": "其余返回 {0}"}
+        ]
+      },
+      "tcL05_fifoOrder_claimsByScore": {
+        "id": "TC-L05",
+        "display": "按 score 顺序依次 claim，验证公平 FIFO 排队推进",
+        "what": "5 个请求按 score 0~4 入队，maxRank=1 保证每次只允许队头 claim。依次 claim req-0 到 req-4，每次 claim 后原 rank=1 的成员晋升为新队头，最终队列清空。",
+        "how": "zadd req-0(0)~req-4(4)，循环 5 次依次 eval 传 req-i/maxRank=1；每次断言 result[0]==1L 且 result[1]==(double)i；全部 claim 完毕后断言 zcard==0。",
+        "metrics": [
+          {"label": "每次 claim 返回值[0]", "expected": "= 1L（全部成功）", "note": "FIFO 顺序保证"},
+          {"label": "每次 claim score",     "expected": "= i（严格对应）",  "note": "score 与入队顺序一致"},
+          {"label": "最终 ZSet 大小",       "expected": "= 0",             "note": "全量清空"}
+        ]
+      }
+    }
+  }
+}
